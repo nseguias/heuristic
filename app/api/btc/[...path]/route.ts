@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { clientIp, rateLimit, tooManyRequests } from "@/lib/ratelimit";
 
 /**
  * Thin proxy in front of an Esplora-compatible API. Defaults to mempool.space;
@@ -6,6 +7,11 @@ import { NextRequest, NextResponse } from "next/server";
  * to drop the public rate limits without touching the frontend.
  */
 const API_BASE = process.env.ESPLORA_API_BASE ?? "https://mempool.space/api";
+
+// Generous: a single deep trace fires many (mostly client-cached) requests, so
+// this allows normal heavy use while capping sustained abuse into the upstream.
+const RATE_LIMIT = 600; // requests
+const RATE_WINDOW = 60_000; // per 60s, per IP
 
 const ALLOWED = [
   /^tx\/[0-9a-f]{64}$/,
@@ -28,9 +34,12 @@ const ALLOWED = [
 const TXIDS_LIMIT = 150;
 
 export async function GET(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ path: string[] }> }
 ) {
+  const rl = rateLimit(`btc:${clientIp(req)}`, RATE_LIMIT, RATE_WINDOW);
+  if (!rl.ok) return tooManyRequests(rl.retryAfter);
+
   const { path } = await params;
   const joined = path.join("/");
 

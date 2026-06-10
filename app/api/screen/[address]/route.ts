@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { buildScreening } from "@/lib/screening";
+import { clientIp, rateLimit, tooManyRequests } from "@/lib/ratelimit";
 import type { EsploraTx } from "@/lib/types";
 
 /**
@@ -15,9 +16,13 @@ const API_BASE = process.env.ESPLORA_API_BASE ?? "https://mempool.space/api";
 const ADDR = /^(bc1[a-zA-HJ-NP-Z0-9]{11,71}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$/;
 
 export async function GET(
-  _req: Request,
+  req: Request,
   { params }: { params: Promise<{ address: string }> }
 ) {
+  // Each call does an upstream lookup, so a tighter limit than the raw proxy.
+  const rl = rateLimit(`screen:${clientIp(req)}`, 40, 60_000);
+  if (!rl.ok) return tooManyRequests(rl.retryAfter);
+
   const { address } = await params;
   if (!ADDR.test(address))
     return NextResponse.json(

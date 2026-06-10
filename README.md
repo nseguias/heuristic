@@ -161,10 +161,21 @@ your own node.
 
 ---
 
+## Guardrails
+
+The public API routes are **rate-limited** (`lib/ratelimit.ts`) as a baseline
+guardrail against abuse into the upstream API, and the proxy enforces a strict
+path **allowlist** (no SSRF). The limiter is per-instance on serverless — for
+production-grade, distributed limiting, put Vercel's WAF or a shared store in
+front. See [`PRINCIPLES.md`](./PRINCIPLES.md) for the engineering philosophy
+(readiness, blast-radius containment, glass-box transparency) this project is
+built on.
+
 ## Contributing
 
-Contributions welcome — see [`CONTRIBUTING.md`](./CONTRIBUTING.md). The single
-highest-impact contribution is **more / better attribution data** (entity labels).
+Contributions welcome — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) and
+[`PRINCIPLES.md`](./PRINCIPLES.md). The single highest-impact contribution is
+**more / better attribution data** (entity labels).
 
 ## License
 

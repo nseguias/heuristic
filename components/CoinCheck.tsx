@@ -3,7 +3,12 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { classifyQuery, fetchAddressTxs, fetchTx } from "@/lib/api";
+import {
+  classifyQuery,
+  fetchAddressTxs,
+  fetchMempoolRecent,
+  fetchTx,
+} from "@/lib/api";
 import { trace } from "@/lib/trace";
 import { buildScreening, type ScreeningReport } from "@/lib/screening";
 import { traceProvenance, type ProvenanceResult } from "@/lib/provenance";
@@ -81,8 +86,30 @@ export default function CoinCheck() {
   const address = params.get("address") ?? "";
   const [value, setValue] = useState(address);
   const [phase, setPhase] = useState<Phase>({ s: "idle" });
+  const [picking, setPicking] = useState(false);
 
   useEffect(() => setValue(address), [address]);
+
+  // Grab a genuinely random recent on-chain wallet to screen.
+  const checkRandom = async () => {
+    setPicking(true);
+    try {
+      const recent = await fetchMempoolRecent().catch(() => []);
+      const shuffled = [...recent].sort(() => Math.random() - 0.5);
+      for (const t of shuffled) {
+        const tx = await fetchTx(t.txid).catch(() => null);
+        const addr = tx?.vout.find(
+          (v) => v.scriptpubkey_address
+        )?.scriptpubkey_address;
+        if (addr) {
+          router.push(`/check?address=${encodeURIComponent(addr)}`);
+          return;
+        }
+      }
+    } finally {
+      setPicking(false);
+    }
+  };
 
   useEffect(() => {
     if (!address) {
@@ -157,7 +184,7 @@ export default function CoinCheck() {
         }}
         className="mt-6"
       >
-        <div className="flex items-center gap-2 rounded-[3px] border border-line bg-surface px-3 py-1 focus-within:border-accent/60">
+        <div className="flex items-center gap-2 rounded-[3px] border border-line bg-surface px-3 py-1 transition-colors focus-within:border-accent/45">
           <span className="font-mono text-sm text-faint">⌕</span>
           <input
             value={value}
@@ -188,6 +215,14 @@ export default function CoinCheck() {
                 {s.label}
               </button>
             ))}
+            <button
+              type="button"
+              onClick={checkRandom}
+              disabled={picking}
+              className="rounded-[2px] border border-line px-2 py-0.5 font-mono text-[10px] text-dim transition-colors hover:border-accent/40 hover:text-accent disabled:opacity-40"
+            >
+              {picking ? "picking…" : "🎲 a random wallet"}
+            </button>
           </div>
         )}
       </form>

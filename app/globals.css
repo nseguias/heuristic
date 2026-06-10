@@ -101,7 +101,9 @@ body {
   scrollbar-color: var(--line-strong) transparent;
 }
 
-input:focus-visible,
+/* Focus ring for buttons & links. Inputs are deliberately excluded — they live
+   inside bordered containers whose focus-within border IS the focus indicator,
+   so an offset outline here would double-box and look harsh. */
 button:focus-visible,
 a:focus-visible {
   outline: 1px solid var(--accent);
