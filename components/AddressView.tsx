@@ -192,6 +192,12 @@ function Ready({
   const last = confirmed[0]?.status.block_time;
   const first = confirmed[confirmed.length - 1]?.status.block_time;
 
+  const TX_PAGE = 15;
+  const [txPage, setTxPage] = useState(0);
+  const txPageCount = Math.max(1, Math.ceil(txs.length / TX_PAGE));
+  const txSafePage = Math.min(txPage, txPageCount - 1);
+  const pageTxs = txs.slice(txSafePage * TX_PAGE, txSafePage * TX_PAGE + TX_PAGE);
+
   return (
     <>
       <Screening report={screening} address={address} />
@@ -215,14 +221,14 @@ function Ready({
 
       {/* Recent transactions */}
       <div className="mt-6">
-        <MicroLabel>Recent transactions · showing {txs.length}</MicroLabel>
+        <MicroLabel>Recent transactions · {txs.length} loaded</MicroLabel>
         <div className="mt-2 overflow-hidden rounded-[3px] border border-line">
           {txs.length === 0 && (
             <div className="flex h-24 items-center justify-center font-mono text-[12px] text-faint">
               no transactions
             </div>
           )}
-          {txs.map((tx) => {
+          {pageTxs.map((tx) => {
             const received = tx.vout
               .filter((v) => v.scriptpubkey_address === address)
               .reduce((s, v) => s + v.value, 0);
@@ -256,6 +262,29 @@ function Ready({
             );
           })}
         </div>
+        {txPageCount > 1 && (
+          <div className="mt-2 flex items-center justify-between font-mono text-[11px] text-dim">
+            <button
+              type="button"
+              onClick={() => setTxPage((p) => Math.max(0, p - 1))}
+              disabled={txSafePage === 0}
+              className="rounded-[2px] border border-line px-2.5 py-1 transition-colors hover:border-accent/40 hover:text-accent disabled:opacity-30"
+            >
+              ← prev
+            </button>
+            <span className="tabular-nums text-faint">
+              page {txSafePage + 1} / {txPageCount}
+            </span>
+            <button
+              type="button"
+              onClick={() => setTxPage((p) => Math.min(txPageCount - 1, p + 1))}
+              disabled={txSafePage >= txPageCount - 1}
+              className="rounded-[2px] border border-line px-2.5 py-1 transition-colors hover:border-accent/40 hover:text-accent disabled:opacity-30"
+            >
+              next →
+            </button>
+          </div>
+        )}
         <p className="mt-2 font-mono text-[10px] text-faint">
           Clustering and taint are computed in the{" "}
           <Link href={`/explore?q=${address}`} className="text-dim underline hover:text-accent">
