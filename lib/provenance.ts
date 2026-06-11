@@ -17,6 +17,7 @@ export type ProvenanceOrigin =
   | "coinbase"
   | "exchange"
   | "flagged"
+  | "mixed" // trail ends at a coinjoin — origin obscured by mixing
   | "depth-limit"
   | "dead-end";
 
@@ -38,7 +39,7 @@ export interface ProvenanceHop {
   label?: string;
   category?: LabelCategory;
   isCoinjoin?: boolean;
-  kind: "tx" | "coinbase" | "exchange" | "flagged";
+  kind: "tx" | "coinbase" | "exchange" | "flagged" | "mixed";
 }
 
 export interface ProvenanceResult {
@@ -50,6 +51,7 @@ export interface ProvenanceResult {
   oldestBlock?: number; // deepest (oldest) block reached on the path
   oldestBlockTime?: number; // its block timestamp (unix seconds) — accurate date
   taintOnPath: boolean; // did the dominant path itself touch any risk?
+  resolved: boolean; // trail ended at a definitive signal (not the depth cap)
   reachedGenesis: boolean;
   score: number; // 0..100 acceptance risk along the path
   band: RiskBand;
@@ -68,9 +70,13 @@ function bandFor(score: number): RiskBand {
 export async function traceProvenance(
   seedTxid: string,
   fetchTx: (id: string) => Promise<EsploraTx>,
-  opts: { maxHops?: number } = {}
+  opts: { maxHops?: number; onHop?: (hop: number) => void } = {}
 ): Promise<ProvenanceResult> {
-  const maxHops = opts.maxHops ?? 60;
+  // Crawl deep. The trail almost always terminates early at a definitive signal
+  // (a flag, a coinjoin, an exchange, or a coinbase); the cap is just the
+  // practical backstop for an otherwise-clean coin, since no typical coin has a
+  // single reachable "genesis".
+  const maxHops = opts.maxHops ?? 200;
   const events: ProvenanceEvent[] = [];
   let score = 0;
   let origin: ProvenanceOrigin = "depth-limit";
@@ -85,6 +91,7 @@ export async function traceProvenance(
   const path: ProvenanceHop[] = [];
 
   for (; current && hop < maxHops; hop++) {
+    opts.onHop?.(hop);
     // Each hop is strictly older — track how far back the path reaches.
     if (current.status.block_height != null)
       oldestBlock = current.status.block_height;
@@ -122,8 +129,9 @@ export async function traceProvenance(
       break;
     }
 
-    // Mixing event — coinjoin is a privacy tool, so risk rises with the NUMBER
-    // of mixes on the path (medium for one or two, higher for heavy mixing).
+    // Coinjoin reached — the trail goes cold here. A mix deliberately severs the
+    // input→output link, so following a "dominant input" past it is meaningless.
+    // This is a definitive, honest stopping point, not incomplete data.
     if (cj) {
       coinjoinCount += 1;
       const mixRisk = mixingRiskFor(coinjoinCount);
@@ -131,9 +139,13 @@ export async function traceProvenance(
       events.push({
         txid: current.txid,
         hop,
-        reason: `coins passed through coinjoin #${coinjoinCount} (mixed)`,
+        reason: "trail ends at a coinjoin — origin obscured by mixing",
         risk: mixRisk,
       });
+      node.kind = "mixed";
+      origin = "mixed";
+      path.push(node);
+      break;
     }
 
     if (hopLabel) {
@@ -193,6 +205,11 @@ export async function traceProvenance(
     oldestBlock,
     oldestBlockTime,
     taintOnPath: events.length > 0,
+    resolved:
+      origin === "coinbase" ||
+      origin === "exchange" ||
+      origin === "flagged" ||
+      origin === "mixed",
     reachedGenesis: origin === "coinbase",
     score: Math.max(0, Math.min(100, score)),
     band: bandFor(score),

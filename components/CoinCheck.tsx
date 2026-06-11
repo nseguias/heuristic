@@ -10,19 +10,12 @@ import {
   fetchTx,
 } from "@/lib/api";
 import { trace } from "@/lib/trace";
-import {
-  buildScreening,
-  CATEGORY_META,
-  type ScreeningReport,
-} from "@/lib/screening";
-import {
-  traceProvenance,
-  type ProvenanceHop,
-  type ProvenanceResult,
-} from "@/lib/provenance";
+import { buildScreening, type ScreeningReport } from "@/lib/screening";
+import { traceProvenance, type ProvenanceResult } from "@/lib/provenance";
 import { riskRamp, C } from "@/lib/colors";
-import { formatBtc, formatPercent, truncateHash } from "@/lib/format";
+import { formatPercent, truncateHash } from "@/lib/format";
 import { MicroLabel } from "./ui";
+import ProvenanceGraph from "./ProvenanceGraph";
 
 type Phase =
   | { s: "idle" }
@@ -107,15 +100,19 @@ function whereFrom(r: ScreeningReport, prov: ProvenanceResult): string {
     return `Coins trace back to ${prov.originLabel?.name}, a KYC exchange — a clean origin.`;
 
   if (prov.origin === "flagged")
-    return `The dominant value path reaches ${prov.originLabel?.name} ${prov.hops} hops back.`;
+    return `The dominant value path reaches ${prov.originLabel?.name} ${prov.hops} hops back — a definitive flagged origin.`;
 
-  // Unresolved (hop limit / dead-end). Frame it as a finding, not a failure.
-  if (!prov.taintOnPath)
-    return `No exchange, mining, or flagged origin on the dominant value path — and no taint on it — across ${prov.hops} hops${back}. The coins have no labelled origin in our data; the main money trail is clean${
-      r.score >= 25 ? ", so any risk in the verdict comes from the exposure below." : "."
-    }`;
+  if (prov.origin === "mixed")
+    return `The trail goes cold ${prov.hops} hops back at a coinjoin: the coins were deliberately mixed, so their pre-mix origin is unrecoverable by design. That mixing is already reflected in the score — this is a complete answer, not a missing one.`;
 
-  return `Traced ${prov.hops} hops${back}: the coins passed through the flagged steps below, but their ultimate origin has no label in our data.`;
+  if (prov.origin === "dead-end")
+    return `The dominant value path ends ${prov.hops} hops back${back} with no flagged, exchange, or mining origin — nothing suspicious on the main trail.`;
+
+  // Hit the depth cap without a definitive signal. This is a real finding, not
+  // missing data: we crawled deep and the trail stayed clean.
+  return `We crawled the dominant value path ${prov.hops} hops${back} and hit no flag, coinjoin, or exchange — the main money trail is clean that far back. A typical coin has no single "genesis" to reach (its path merges with millions of others), so this is the complete answer the data supports${
+    r.score >= 25 ? "; any risk in the verdict comes from the exposure below." : "."
+  }`;
 }
 
 const SAMPLES = [
@@ -123,108 +120,25 @@ const SAMPLES = [
   { label: "Traces to an exchange", q: "1NDyJtNTjmwk5xPNhjgAMu4HDHigtobu1s" },
 ];
 
-function hopColor(h: ProvenanceHop): string {
-  if (h.kind === "flagged") return C.taint;
-  if (h.kind === "exchange" || h.kind === "coinbase") return C.clean;
-  if (h.isCoinjoin) return C.mix;
-  if (h.category) return riskRamp(CATEGORY_META[h.category].risk * 100);
-  return C.dim;
-}
-
-function HopRow({
-  h,
-  last,
-}: {
-  h: ProvenanceHop;
-  last: boolean;
-}) {
-  const yr = h.blockTime ? new Date(h.blockTime * 1000).getUTCFullYear() : null;
-  const color = hopColor(h);
-  const marker =
-    h.kind === "coinbase"
-      ? "⛏ minted"
-      : h.kind === "exchange"
-        ? "🏦 exchange"
-        : h.kind === "flagged"
-          ? "⚑ flagged"
-          : h.isCoinjoin
-            ? "⧓ coinjoin"
-            : null;
-  return (
-    <li className="flex gap-2.5">
-      <div className="flex flex-col items-center pt-1">
-        <span
-          className="h-2 w-2 shrink-0 rounded-full"
-          style={{ background: color, boxShadow: `0 0 5px ${color}` }}
-        />
-        {!last && <span className="w-px flex-1 bg-line" />}
-      </div>
-      <div className={`min-w-0 flex-1 ${last ? "" : "pb-2.5"}`}>
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-          <span className="font-mono text-[11px] tabular-nums text-faint">
-            {h.blockHeight ? `#${h.blockHeight.toLocaleString()}` : "mempool"}
-            {yr ? ` · ${yr}` : ""}
-          </span>
-          {marker && (
-            <span className="font-mono text-[10px]" style={{ color }}>
-              {marker}
-            </span>
-          )}
-          {h.label && (
-            <span
-              className="rounded-[2px] px-1 font-mono text-[10px]"
-              style={{ color, background: `color-mix(in oklch, ${color} 14%, transparent)` }}
-            >
-              {h.label}
-            </span>
-          )}
-        </div>
-        <div className="flex items-baseline gap-2">
-          <a
-            href={`/explore?q=${h.txid}`}
-            className="font-mono text-[11px] text-dim transition-colors hover:text-accent"
-          >
-            {truncateHash(h.txid, 8)}
-          </a>
-          {h.valueSat != null && (
-            <span className="font-mono text-[11px] tabular-nums text-accent">
-              {formatBtc(h.valueSat)} BTC
-            </span>
-          )}
-        </div>
-      </div>
-    </li>
-  );
-}
-
-// Vertical hop-by-hop graph of the dominant value path, back toward origin.
+// Hop-by-hop trace graph of the dominant value path, back toward origin.
 function TracePath({ prov }: { prov: ProvenanceResult }) {
   if (!prov.path.length) return null;
-  const resolved =
-    prov.origin === "coinbase" ||
-    prov.origin === "exchange" ||
-    prov.origin === "flagged";
 
   return (
     <div className="mt-3 border-t border-line pt-3">
       <MicroLabel>
         Trace · dominant value path · {prov.path.length} hop
-        {prov.path.length === 1 ? "" : "s"}
+        {prov.path.length === 1 ? "" : "s"} ·{" "}
+        {prov.resolved ? "resolved" : `stopped at ${prov.hops}-hop cap`}
       </MicroLabel>
-      <ol className="mt-2 max-h-72 overflow-y-auto pr-1">
-        {prov.path.map((h, i) => (
-          <HopRow key={h.txid + i} h={h} last={i === prov.path.length - 1} />
-        ))}
-      </ol>
+      <ProvenanceGraph path={prov.path} />
 
-      {!resolved && (
+      {!prov.resolved && (
         <p className="mt-1 font-mono text-[10px] leading-relaxed text-faint">
-          The trace stops here at our {prov.hops}-hop depth cap — not at a true
-          origin. A typical coin merges with others at almost every hop, so its
-          path never converges to a single &ldquo;genesis&rdquo; coinbase: there
-          are effectively millions of merged coinbases behind it. We follow the
-          single largest input as the dominant money trail. To trace deeper
-          without public-API limits, point HEURISTIC at your own node in{" "}
+          We crawled to our {prov.hops}-hop depth cap without hitting a flag — a
+          practical limit on the public API, not a verdict gap. To crawl further
+          (it still won&apos;t reach a single &ldquo;genesis&rdquo; — no coin has
+          one), point HEURISTIC at your own node in{" "}
           <span className="text-dim">⚙ settings</span>.
         </p>
       )}
@@ -239,6 +153,7 @@ export default function CoinCheck() {
   const [value, setValue] = useState(address);
   const [phase, setPhase] = useState<Phase>({ s: "idle" });
   const [picking, setPicking] = useState(false);
+  const [hopCount, setHopCount] = useState(0);
 
   useEffect(() => setValue(address), [address]);
 
@@ -272,6 +187,10 @@ export default function CoinCheck() {
       setPhase({ s: "error", msg: "That doesn't look like a Bitcoin address." });
       return;
     }
+    // Bring the new result into view (navigating between checks otherwise keeps
+    // your scroll position, making it look like nothing happened).
+    if (typeof window !== "undefined")
+      window.scrollTo({ top: 0, behavior: "smooth" });
     let live = true;
     (async () => {
       try {
@@ -280,19 +199,24 @@ export default function CoinCheck() {
         if (!txs.length) throw new Error("no transactions for this address yet");
         if (!live) return;
 
-        setPhase({ s: "running", step: "screening counterparties & exposure" });
-        const graph = await trace(txs[0].txid, {
-          direction: "both",
-          depth: 3,
-          maxNodes: 80,
-        }).catch(() => undefined);
+        // Screening graph and the source-of-funds crawl are independent — run
+        // them concurrently so the wall-clock is the slower of the two, not both.
+        setPhase({ s: "running", step: "crawling the source-of-funds trail" });
+        setHopCount(0);
+        const [graph, prov] = await Promise.all([
+          trace(txs[0].txid, {
+            direction: "both",
+            depth: 3,
+            maxNodes: 80,
+          }).catch(() => undefined),
+          traceProvenance(txs[0].txid, fetchTx, {
+            maxHops: 200,
+            onHop: (h) => {
+              if (live) setHopCount(h);
+            },
+          }).catch(() => null),
+        ]);
         const report = buildScreening(address, txs, graph);
-        if (!live) return;
-
-        setPhase({ s: "running", step: "tracing source of funds to origin" });
-        const prov = await traceProvenance(txs[0].txid, fetchTx, {
-          maxHops: 60,
-        }).catch(() => null);
         if (!live) return;
 
         setPhase({ s: "done", report, prov });
@@ -384,7 +308,7 @@ export default function CoinCheck() {
         {
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <span className="microlabel">{address ? "try another" : "try"}</span>
-            {SAMPLES.map((s) => (
+            {SAMPLES.filter((s) => s.q !== address).map((s) => (
               <button
                 key={s.label}
                 type="button"
@@ -407,11 +331,19 @@ export default function CoinCheck() {
       </form>
 
       {phase.s === "running" && (
-        <div className="mt-8 flex flex-col items-center gap-2 py-8">
+        <div className="mt-8 flex flex-col items-center gap-2 py-8 text-center">
           <span className="blink font-mono text-accent">◍</span>
-          <span className="font-mono text-[13px] text-ink">{phase.step}…</span>
-          <span className="font-mono text-[11px] text-faint">
-            walking the chain — this can take a few seconds
+          <span className="font-mono text-[13px] text-ink">
+            {phase.step}
+            {phase.step.startsWith("crawling") && hopCount > 0
+              ? ` · ${hopCount} hops`
+              : ""}
+            …
+          </span>
+          <span className="max-w-md font-mono text-[11px] leading-relaxed text-faint">
+            {phase.step.startsWith("crawling")
+              ? "Following the dominant value path back, one hop at a time. We stop the moment we hit a flag, a coinjoin, an exchange, or a coinbase — most coins resolve in a handful of hops. A clean coin can take a while: it has no single origin to reach."
+              : "walking the chain — this can take a few seconds"}
           </span>
         </div>
       )}

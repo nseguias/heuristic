@@ -301,8 +301,9 @@ const ORIGIN_LABEL: Record<ProvenanceResult["origin"], string> = {
   coinbase: "⛏ Coinbase (freshly mined)",
   exchange: "KYC exchange",
   flagged: "Flagged entity",
-  "depth-limit": "Unresolved (hop limit)",
-  "dead-end": "Unresolved",
+  mixed: "⧓ Coinjoin (origin obscured)",
+  "depth-limit": "Crawled to depth cap",
+  "dead-end": "Trail dead-end",
 };
 
 function Provenance({ result }: { result: ProvenanceResult | null }) {
