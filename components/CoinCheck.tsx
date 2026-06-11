@@ -10,10 +10,18 @@ import {
   fetchTx,
 } from "@/lib/api";
 import { trace } from "@/lib/trace";
-import { buildScreening, type ScreeningReport } from "@/lib/screening";
-import { traceProvenance, type ProvenanceResult } from "@/lib/provenance";
+import {
+  buildScreening,
+  CATEGORY_META,
+  type ScreeningReport,
+} from "@/lib/screening";
+import {
+  traceProvenance,
+  type ProvenanceHop,
+  type ProvenanceResult,
+} from "@/lib/provenance";
 import { riskRamp, C } from "@/lib/colors";
-import { formatPercent, truncateHash } from "@/lib/format";
+import { formatBtc, formatPercent, truncateHash } from "@/lib/format";
 import { MicroLabel } from "./ui";
 
 type Phase =
@@ -112,8 +120,117 @@ function whereFrom(r: ScreeningReport, prov: ProvenanceResult): string {
 
 const SAMPLES = [
   { label: "A hack wallet (bad)", q: "1FeexV6bAHb8ybZjqQMjJrcCrHGW9sb6uF" },
-  { label: "An exchange (good)", q: "1NDyJtNTjmwk5xPNhjgAMu4HDHigtobu1s" },
+  { label: "Traces to an exchange", q: "1NDyJtNTjmwk5xPNhjgAMu4HDHigtobu1s" },
 ];
+
+function hopColor(h: ProvenanceHop): string {
+  if (h.kind === "flagged") return C.taint;
+  if (h.kind === "exchange" || h.kind === "coinbase") return C.clean;
+  if (h.isCoinjoin) return C.mix;
+  if (h.category) return riskRamp(CATEGORY_META[h.category].risk * 100);
+  return C.dim;
+}
+
+function HopRow({
+  h,
+  last,
+}: {
+  h: ProvenanceHop;
+  last: boolean;
+}) {
+  const yr = h.blockTime ? new Date(h.blockTime * 1000).getUTCFullYear() : null;
+  const color = hopColor(h);
+  const marker =
+    h.kind === "coinbase"
+      ? "⛏ minted"
+      : h.kind === "exchange"
+        ? "🏦 exchange"
+        : h.kind === "flagged"
+          ? "⚑ flagged"
+          : h.isCoinjoin
+            ? "⧓ coinjoin"
+            : null;
+  return (
+    <li className="flex gap-2.5">
+      <div className="flex flex-col items-center pt-1">
+        <span
+          className="h-2 w-2 shrink-0 rounded-full"
+          style={{ background: color, boxShadow: `0 0 5px ${color}` }}
+        />
+        {!last && <span className="w-px flex-1 bg-line" />}
+      </div>
+      <div className={`min-w-0 flex-1 ${last ? "" : "pb-2.5"}`}>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+          <span className="font-mono text-[11px] tabular-nums text-faint">
+            {h.blockHeight ? `#${h.blockHeight.toLocaleString()}` : "mempool"}
+            {yr ? ` · ${yr}` : ""}
+          </span>
+          {marker && (
+            <span className="font-mono text-[10px]" style={{ color }}>
+              {marker}
+            </span>
+          )}
+          {h.label && (
+            <span
+              className="rounded-[2px] px-1 font-mono text-[10px]"
+              style={{ color, background: `color-mix(in oklch, ${color} 14%, transparent)` }}
+            >
+              {h.label}
+            </span>
+          )}
+        </div>
+        <div className="flex items-baseline gap-2">
+          <a
+            href={`/explore?q=${h.txid}`}
+            className="font-mono text-[11px] text-dim transition-colors hover:text-accent"
+          >
+            {truncateHash(h.txid, 8)}
+          </a>
+          {h.valueSat != null && (
+            <span className="font-mono text-[11px] tabular-nums text-accent">
+              {formatBtc(h.valueSat)} BTC
+            </span>
+          )}
+        </div>
+      </div>
+    </li>
+  );
+}
+
+// Vertical hop-by-hop graph of the dominant value path, back toward origin.
+function TracePath({ prov }: { prov: ProvenanceResult }) {
+  if (!prov.path.length) return null;
+  const resolved =
+    prov.origin === "coinbase" ||
+    prov.origin === "exchange" ||
+    prov.origin === "flagged";
+
+  return (
+    <div className="mt-3 border-t border-line pt-3">
+      <MicroLabel>
+        Trace · dominant value path · {prov.path.length} hop
+        {prov.path.length === 1 ? "" : "s"}
+      </MicroLabel>
+      <ol className="mt-2 max-h-72 overflow-y-auto pr-1">
+        {prov.path.map((h, i) => (
+          <HopRow key={h.txid + i} h={h} last={i === prov.path.length - 1} />
+        ))}
+      </ol>
+
+      {!resolved && (
+        <p className="mt-1 font-mono text-[10px] leading-relaxed text-faint">
+          The trace stops here at our {prov.hops}-hop depth cap — not at a true
+          origin. A typical coin merges with others at almost every hop, so its
+          path never converges to a single &ldquo;genesis&rdquo; coinbase: there
+          are effectively millions of merged coinbases behind it. We follow the
+          single largest input as the dominant money trail. To trace deeper
+          without public-API limits, point HEURISTIC at your own node in{" "}
+          <span className="text-dim">⚙ settings</span>.
+        </p>
+      )}
+    </div>
+  );
+}
 
 export default function CoinCheck() {
   const router = useRouter();
@@ -231,11 +348,11 @@ export default function CoinCheck() {
           Is this coin safe to accept?
         </h1>
         <p className="mt-2 font-mono text-[13px] leading-relaxed text-dim">
-          Paste the <span className="text-ink">sender&apos;s</span> Bitcoin
-          address — the wallet that&apos;s about to pay you — or the transaction
-          id of the incoming coins. HEURISTIC traces its history back toward
-          origin, screens it against sanctions and known entities, and tells you
-          whether an exchange would accept it.
+          Paste the <span className="text-ink">sender&apos;s</span>{" "}
+          Bitcoin address — the wallet that&apos;s about to pay you — or the
+          transaction id of the incoming coins. HEURISTIC traces its history
+          back toward origin, screens it against sanctions and known entities,
+          and tells you whether an exchange would accept it.
         </p>
       </div>
 
@@ -264,9 +381,9 @@ export default function CoinCheck() {
             check
           </button>
         </div>
-        {!address && (
+        {
           <div className="mt-2 flex flex-wrap items-center gap-2">
-            <span className="microlabel">try</span>
+            <span className="microlabel">{address ? "try another" : "try"}</span>
             {SAMPLES.map((s) => (
               <button
                 key={s.label}
@@ -286,7 +403,7 @@ export default function CoinCheck() {
               {picking ? "picking…" : "🎲 a random wallet"}
             </button>
           </div>
-        )}
+        }
       </form>
 
       {phase.s === "running" && (
@@ -385,6 +502,7 @@ function Result({
               ))}
             </ul>
           )}
+          <TracePath prov={prov} />
         </div>
       )}
 

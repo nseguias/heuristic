@@ -1,4 +1,4 @@
-import type { EsploraTx, EntityLabel, RiskBand } from "./types";
+import type { EsploraTx, EntityLabel, RiskBand, LabelCategory } from "./types";
 import { detectCoinjoin, inputAddresses, mixingRiskFor } from "./heuristics";
 import { labelFor } from "./labels";
 
@@ -28,6 +28,19 @@ export interface ProvenanceEvent {
   risk: number;
 }
 
+/** One step on the dominant value path, for the hop-by-hop trace graph. */
+export interface ProvenanceHop {
+  hop: number;
+  txid: string;
+  blockHeight?: number;
+  blockTime?: number;
+  valueSat?: number; // value carried into this tx by the followed input
+  label?: string;
+  category?: LabelCategory;
+  isCoinjoin?: boolean;
+  kind: "tx" | "coinbase" | "exchange" | "flagged";
+}
+
 export interface ProvenanceResult {
   seed: string;
   hops: number;
@@ -41,6 +54,7 @@ export interface ProvenanceResult {
   score: number; // 0..100 acceptance risk along the path
   band: RiskBand;
   events: ProvenanceEvent[]; // notable risk events encountered
+  path: ProvenanceHop[]; // the full dominant value path, hop by hop
 }
 
 function bandFor(score: number): RiskBand {
@@ -68,6 +82,7 @@ export async function traceProvenance(
   let current: EsploraTx | null = await fetchTx(seedTxid).catch(() => null);
   let hop = 0;
   let coinjoinCount = 0;
+  const path: ProvenanceHop[] = [];
 
   for (; current && hop < maxHops; hop++) {
     // Each hop is strictly older — track how far back the path reaches.
@@ -76,16 +91,40 @@ export async function traceProvenance(
     if (current.status.block_time != null)
       oldestBlockTime = current.status.block_time;
 
-    // Coinbase reached — this is where the coins were minted.
-    if (current.vin.some((v) => v.is_coinbase)) {
+    const isCoinbase = current.vin.some((v) => v.is_coinbase);
+    const cj = !isCoinbase && detectCoinjoin(current).isCoinjoin;
+
+    // Strongest label on this hop's input addresses.
+    let hopLabel: EntityLabel | undefined;
+    if (!isCoinbase)
+      for (const a of inputAddresses(current)) {
+        const l = labelFor(a);
+        if (l && (!hopLabel || l.risk > hopLabel.risk)) hopLabel = l;
+      }
+
+    const node: ProvenanceHop = {
+      hop,
+      txid: current.txid,
+      blockHeight: current.status.block_height ?? undefined,
+      blockTime: current.status.block_time ?? undefined,
+      label: hopLabel?.name,
+      category: hopLabel?.category,
+      isCoinjoin: cj || undefined,
+      kind: "tx",
+    };
+
+    // Coinbase reached — the coins were minted here.
+    if (isCoinbase) {
+      node.kind = "coinbase";
       origin = "coinbase";
       originBlock = current.status.block_height;
+      path.push(node);
       break;
     }
 
     // Mixing event — coinjoin is a privacy tool, so risk rises with the NUMBER
     // of mixes on the path (medium for one or two, higher for heavy mixing).
-    if (detectCoinjoin(current).isCoinjoin) {
+    if (cj) {
       coinjoinCount += 1;
       const mixRisk = mixingRiskFor(coinjoinCount);
       score = Math.max(score, mixRisk);
@@ -97,12 +136,6 @@ export async function traceProvenance(
       });
     }
 
-    // Strongest label on this hop's input addresses.
-    let hopLabel: EntityLabel | undefined;
-    for (const a of inputAddresses(current)) {
-      const l = labelFor(a);
-      if (l && (!hopLabel || l.risk > hopLabel.risk)) hopLabel = l;
-    }
     if (hopLabel) {
       const r = hopLabel.risk * 100;
       score = Math.max(score, r);
@@ -119,13 +152,17 @@ export async function traceProvenance(
         });
       // A KYC exchange or a strong criminal origin establishes provenance — stop.
       if (hopLabel.category === "exchange") {
+        node.kind = "exchange";
         origin = "exchange";
         originLabel = hopLabel;
+        path.push(node);
         break;
       }
       if (hopLabel.risk >= 0.9) {
+        node.kind = "flagged";
         origin = "flagged";
         originLabel = hopLabel;
+        path.push(node);
         break;
       }
     }
@@ -136,8 +173,11 @@ export async function traceProvenance(
       .sort((a, b) => (b.prevout?.value ?? 0) - (a.prevout?.value ?? 0));
     if (!parents.length) {
       origin = "dead-end";
+      path.push(node);
       break;
     }
+    node.valueSat = parents[0].prevout?.value;
+    path.push(node);
     current = await fetchTx(parents[0].txid).catch(() => null);
   }
 
@@ -157,5 +197,6 @@ export async function traceProvenance(
     score: Math.max(0, Math.min(100, score)),
     band: bandFor(score),
     events: events.slice(0, 8),
+    path,
   };
 }

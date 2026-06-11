@@ -22,17 +22,9 @@ export default function Header() {
       </Link>
 
       <nav className="flex items-center gap-1 font-mono text-[13px]">
-        {/* Primary feature — checking a coin before you accept it. */}
-        <Link
-          href="/check"
-          className={`rounded-[2px] border px-3 py-1.5 transition-colors ${
-            pathname.startsWith("/check")
-              ? "border-accent bg-accent text-bg"
-              : "border-accent/50 text-accent hover:bg-accent hover:text-bg"
-          }`}
-        >
-          ✓ Check a coin
-        </Link>
+        <NavLink href="/check" active={pathname.startsWith("/check")}>
+          Check a coin
+        </NavLink>
         <NavLink href="/explore" active={pathname.startsWith("/explore")}>
           Explore
         </NavLink>
