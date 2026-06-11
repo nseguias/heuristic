@@ -40,6 +40,13 @@ export interface ProvenanceHop {
   category?: LabelCategory;
   isCoinjoin?: boolean;
   kind: "tx" | "coinbase" | "exchange" | "flagged" | "mixed";
+  /** The OTHER inputs that merged into this tx (the branches off the spine). */
+  branches?: {
+    txid: string;
+    valueSat: number;
+    label?: string;
+    category?: LabelCategory;
+  }[];
 }
 
 export interface ProvenanceResult {
@@ -189,6 +196,18 @@ export async function traceProvenance(
       break;
     }
     node.valueSat = parents[0].prevout?.value;
+    // The other inputs that merged into this tx — branches off the dominant
+    // spine. Free: we already have the prevouts. Top 4 by value.
+    node.branches = parents.slice(1, 5).map((p) => {
+      const a = p.prevout?.scriptpubkey_address;
+      const l = a ? labelFor(a) : undefined;
+      return {
+        txid: p.txid,
+        valueSat: p.prevout?.value ?? 0,
+        label: l?.name,
+        category: l?.category,
+      };
+    });
     path.push(node);
     current = await fetchTx(parents[0].txid).catch(() => null);
   }
