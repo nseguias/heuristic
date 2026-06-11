@@ -75,6 +75,41 @@ function verdictFor(r: ScreeningReport, prov: ProvenanceResult | null): Verdict 
   };
 }
 
+/** Accurate "~YYYY" from a block timestamp (never a future year). */
+function yearOf(unixSec?: number): string {
+  if (!unixSec) return "";
+  const y = new Date(unixSec * 1000).getUTCFullYear();
+  return ` back to ${y}`;
+}
+
+// Honest, useful prose for the source-of-funds section — never presents an
+// unresolved trace as if the verdict depended on it.
+function whereFrom(r: ScreeningReport, prov: ProvenanceResult): string {
+  const back = yearOf(prov.oldestBlockTime);
+
+  // The sender itself is the flagged entity — provenance is supplementary, and
+  // the verdict stands on complete data (we know this wallet), not the trace.
+  if (r.self && r.self.risk >= 0.5)
+    return `These coins sit in the flagged wallet itself (${r.self.name}) — that alone decides the verdict, so tracing their deeper origin isn't required.`;
+
+  if (prov.reachedGenesis)
+    return `Traced ${prov.hops} hops to freshly-mined coins (block ${prov.originBlock?.toLocaleString()}) — the cleanest possible lineage.`;
+
+  if (prov.origin === "exchange")
+    return `Coins trace back to ${prov.originLabel?.name}, a KYC exchange — a clean origin.`;
+
+  if (prov.origin === "flagged")
+    return `The dominant value path reaches ${prov.originLabel?.name} ${prov.hops} hops back.`;
+
+  // Unresolved (hop limit / dead-end). Frame it as a finding, not a failure.
+  if (!prov.taintOnPath)
+    return `No exchange, mining, or flagged origin on the dominant value path — and no taint on it — across ${prov.hops} hops${back}. The coins have no labelled origin in our data; the main money trail is clean${
+      r.score >= 25 ? ", so any risk in the verdict comes from the exposure below." : "."
+    }`;
+
+  return `Traced ${prov.hops} hops${back}: the coins passed through the flagged steps below, but their ultimate origin has no label in our data.`;
+}
+
 const SAMPLES = [
   { label: "A hack wallet (bad)", q: "1FeexV6bAHb8ybZjqQMjJrcCrHGW9sb6uF" },
   { label: "An exchange (good)", q: "1NDyJtNTjmwk5xPNhjgAMu4HDHigtobu1s" },
@@ -139,7 +174,7 @@ export default function CoinCheck() {
 
         setPhase({ s: "running", step: "tracing source of funds to origin" });
         const prov = await traceProvenance(txs[0].txid, fetchTx, {
-          maxHops: 40,
+          maxHops: 60,
         }).catch(() => null);
         if (!live) return;
 
@@ -157,10 +192,35 @@ export default function CoinCheck() {
     };
   }, [address]);
 
-  const submit = (q: string) => {
-    const a = q.trim();
-    if (classifyQuery(a) === "address")
-      router.push(`/check?address=${encodeURIComponent(a)}`);
+  const submit = async (q: string) => {
+    const raw = q.trim();
+    if (!raw) return;
+    if (classifyQuery(raw) === "address") {
+      router.push(`/check?address=${encodeURIComponent(raw)}`);
+      return;
+    }
+    // A transaction id or UTXO (txid:vout) — resolve the sender (the dominant
+    // input address paying you) and screen them.
+    const txid = raw.split(":")[0].trim();
+    if (/^[0-9a-f]{64}$/i.test(txid)) {
+      setPhase({ s: "running", step: "resolving the sender from that transaction" });
+      const tx = await fetchTx(txid).catch(() => null);
+      const sender = tx?.vin
+        .filter((v) => v.prevout?.scriptpubkey_address)
+        .sort((x, y) => (y.prevout?.value ?? 0) - (x.prevout?.value ?? 0))[0]
+        ?.prevout?.scriptpubkey_address;
+      if (sender) router.push(`/check?address=${encodeURIComponent(sender)}`);
+      else
+        setPhase({
+          s: "error",
+          msg: "couldn't find a sender address in that transaction (a coinbase / mined tx has none)",
+        });
+      return;
+    }
+    setPhase({
+      s: "error",
+      msg: "that doesn't look like a Bitcoin address or transaction id",
+    });
   };
 
   return (
@@ -171,9 +231,11 @@ export default function CoinCheck() {
           Is this coin safe to accept?
         </h1>
         <p className="mt-2 font-mono text-[13px] leading-relaxed text-dim">
-          Paste the Bitcoin address you&apos;re about to receive from. HEURISTIC
-          traces its history back toward origin, screens it against sanctions and
-          known entities, and tells you whether an exchange would accept it.
+          Paste the <span className="text-ink">sender&apos;s</span> Bitcoin
+          address — the wallet that&apos;s about to pay you — or the transaction
+          id of the incoming coins. HEURISTIC traces its history back toward
+          origin, screens it against sanctions and known entities, and tells you
+          whether an exchange would accept it.
         </p>
       </div>
 
@@ -189,10 +251,10 @@ export default function CoinCheck() {
           <input
             value={value}
             onChange={(e) => setValue(e.target.value)}
-            placeholder="bitcoin address…"
+            placeholder="sender's address or transaction id…"
             spellCheck={false}
             autoComplete="off"
-            aria-label="Bitcoin address to check"
+            aria-label="Sender's Bitcoin address or transaction id to check"
             className="min-w-0 flex-1 bg-transparent py-2.5 font-mono text-[14px] text-ink placeholder:text-faint focus:outline-none"
           />
           <button
@@ -306,13 +368,7 @@ function Result({
         <div className="mt-3 rounded-[3px] border border-line bg-surface/40 px-4 py-3">
           <MicroLabel>Where the money came from</MicroLabel>
           <p className="mt-1.5 font-mono text-[13px] leading-relaxed text-ink">
-            {prov.reachedGenesis
-              ? `Traced back ${prov.hops} hops to freshly-mined coins (block ${prov.originBlock?.toLocaleString()}) — a clean lineage.`
-              : prov.origin === "exchange"
-                ? `Funds originate from ${prov.originLabel?.name} — a KYC exchange.`
-                : prov.origin === "flagged"
-                  ? `Lineage hits ${prov.originLabel?.name} ${prov.hops} hops back.`
-                  : `Followed the main value path back ${prov.hops} hops; origin not fully resolved.`}
+            {whereFrom(report, prov)}
           </p>
           {prov.events.length > 0 && (
             <ul className="mt-1.5 space-y-0.5">

@@ -34,6 +34,9 @@ export interface ProvenanceResult {
   origin: ProvenanceOrigin;
   originLabel?: EntityLabel;
   originBlock?: number;
+  oldestBlock?: number; // deepest (oldest) block reached on the path
+  oldestBlockTime?: number; // its block timestamp (unix seconds) — accurate date
+  taintOnPath: boolean; // did the dominant path itself touch any risk?
   reachedGenesis: boolean;
   score: number; // 0..100 acceptance risk along the path
   band: RiskBand;
@@ -53,18 +56,26 @@ export async function traceProvenance(
   fetchTx: (id: string) => Promise<EsploraTx>,
   opts: { maxHops?: number } = {}
 ): Promise<ProvenanceResult> {
-  const maxHops = opts.maxHops ?? 40;
+  const maxHops = opts.maxHops ?? 60;
   const events: ProvenanceEvent[] = [];
   let score = 0;
   let origin: ProvenanceOrigin = "depth-limit";
   let originLabel: EntityLabel | undefined;
   let originBlock: number | undefined;
+  let oldestBlock: number | undefined;
+  let oldestBlockTime: number | undefined;
 
   let current: EsploraTx | null = await fetchTx(seedTxid).catch(() => null);
   let hop = 0;
   let coinjoinCount = 0;
 
   for (; current && hop < maxHops; hop++) {
+    // Each hop is strictly older — track how far back the path reaches.
+    if (current.status.block_height != null)
+      oldestBlock = current.status.block_height;
+    if (current.status.block_time != null)
+      oldestBlockTime = current.status.block_time;
+
     // Coinbase reached — this is where the coins were minted.
     if (current.vin.some((v) => v.is_coinbase)) {
       origin = "coinbase";
@@ -139,6 +150,9 @@ export async function traceProvenance(
     origin,
     originLabel,
     originBlock,
+    oldestBlock,
+    oldestBlockTime,
+    taintOnPath: events.length > 0,
     reachedGenesis: origin === "coinbase",
     score: Math.max(0, Math.min(100, score)),
     band: bandFor(score),
