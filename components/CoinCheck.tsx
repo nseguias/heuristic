@@ -215,6 +215,30 @@ export default function CoinCheck() {
   const [taintProgress, setTaintProgress] = useState<{ n: number; cov: number } | null>(
     null
   );
+  // The taint result lives here so "keep crawling" can resume + replace it.
+  const [liveTaint, setLiveTaint] = useState<TaintResult | null>(null);
+  const [crawling, setCrawling] = useState(false);
+
+  const keepCrawling = async () => {
+    if (!liveTaint || crawling || liveTaint.done) return;
+    setCrawling(true);
+    try {
+      const res = await traceTaint(
+        liveTaint.seed,
+        fetchTx,
+        {
+          timeBudgetMs: 16000,
+          onProgress: (n, cov) => setTaintProgress({ n, cov }),
+        },
+        liveTaint.state
+      );
+      setLiveTaint(res);
+    } catch {
+      /* keep the prior partial result */
+    } finally {
+      setCrawling(false);
+    }
+  };
 
   useEffect(() => setValue(address), [address]);
 
@@ -252,6 +276,7 @@ export default function CoinCheck() {
     // your scroll position, making it look like nothing happened).
     if (typeof window !== "undefined")
       window.scrollTo({ top: 0, behavior: "smooth" });
+    setLiveTaint(null);
     let live = true;
     (async () => {
       try {
@@ -283,8 +308,7 @@ export default function CoinCheck() {
           self
             ? Promise.resolve(null)
             : traceTaint(txs[0].txid, fetchTx, {
-                maxNodes: 800,
-                timeBudgetMs: 18000,
+                timeBudgetMs: 16000,
                 onProgress: (n, cov) => {
                   if (live) setTaintProgress({ n, cov });
                 },
@@ -293,6 +317,7 @@ export default function CoinCheck() {
         const report = buildScreening(address, txs, graph);
         if (!live) return;
 
+        setLiveTaint(taint);
         setPhase({ s: "done", report, prov, taint });
       } catch (e) {
         if (live)
@@ -435,7 +460,9 @@ export default function CoinCheck() {
           address={address}
           report={phase.report}
           prov={phase.prov}
-          taint={phase.taint}
+          taint={liveTaint}
+          crawling={crawling}
+          onKeepCrawling={keepCrawling}
         />
       )}
     </main>
@@ -451,7 +478,15 @@ function originColor(o: TaintResult["origins"][number]): string {
 
 // The honest "we checked everything" panel: value-weighted breakdown of where
 // the coin's value comes from, across ALL ancestry paths, with coverage.
-function ValueBreakdown({ taint }: { taint: TaintResult }) {
+function ValueBreakdown({
+  taint,
+  crawling,
+  onKeepCrawling,
+}: {
+  taint: TaintResult;
+  crawling: boolean;
+  onKeepCrawling: () => void;
+}) {
   const segs = [
     { label: "clean", frac: taint.cleanFraction, color: C.clean },
     { label: "mixed", frac: taint.mixedFraction, color: C.mix },
@@ -493,10 +528,23 @@ function ValueBreakdown({ taint }: { taint: TaintResult }) {
         Every funding path is followed back and weighted by how much of the
         coin&apos;s value flows through it, until it reaches a known entity, a
         coinbase, or a coinjoin — not just the largest input.{" "}
-        {taint.coverage >= 0.9
-          ? `${pct(taint.coverage)} of the value is accounted for, so this is a complete result.`
-          : `${pct(1 - taint.coverage)} couldn't be traced within the public-API budget — connect your own node (⚙ settings) for full coverage.`}
+        {taint.done
+          ? "The frontier is empty — every path is fully resolved. This is the complete picture."
+          : `${pct(taint.unresolvedFraction)} of the value is still queued (${taint.frontierSize.toLocaleString()} ancestor txs). The only limit is fetch throughput on the public API — keep crawling to push coverage higher, or connect your own node for the full picture instantly.`}
       </p>
+
+      {!taint.done && (
+        <button
+          type="button"
+          onClick={onKeepCrawling}
+          disabled={crawling}
+          className="mt-2.5 w-full rounded-[2px] border border-accent/50 px-3 py-2 font-mono text-[12px] uppercase tracking-wider text-accent transition-colors hover:bg-accent hover:text-bg disabled:opacity-50"
+        >
+          {crawling
+            ? "crawling deeper…"
+            : `↓ keep crawling · ${pct(taint.coverage)} covered · ${taint.frontierSize.toLocaleString()} to go`}
+        </button>
+      )}
     </div>
   );
 }
@@ -506,11 +554,15 @@ function Result({
   report,
   prov,
   taint,
+  crawling,
+  onKeepCrawling,
 }: {
   address: string;
   report: ScreeningReport;
   prov: ProvenanceResult | null;
   taint: TaintResult | null;
+  crawling: boolean;
+  onKeepCrawling: () => void;
 }) {
   const v = verdictFor(report, taint);
   const score = Math.max(report.score, taint?.score ?? 0);
@@ -556,7 +608,13 @@ function Result({
       </div>
 
       {/* Value-weighted source-of-funds (all paths) */}
-      {taint && <ValueBreakdown taint={taint} />}
+      {taint && (
+        <ValueBreakdown
+          taint={taint}
+          crawling={crawling}
+          onKeepCrawling={onKeepCrawling}
+        />
+      )}
 
       {/* Source of funds */}
       {prov && (
