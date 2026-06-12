@@ -30,7 +30,7 @@ export interface TaintOrigin {
 export interface TaintNode {
   txid: string;
   contribution: number;
-  kind: "tx" | "coinbase" | "mixed" | OriginKey;
+  kind: "tx" | "coinbase" | "mixed" | "frontier" | OriginKey;
   category?: LabelCategory;
   label?: string;
   blockTime?: number;
@@ -243,7 +243,8 @@ export async function traceTaint(
     visited,
     nodes,
     edges,
-    visitedCount
+    visitedCount,
+    minFraction
   );
 }
 
@@ -256,13 +257,19 @@ function snapshot(
   visited: Set<string>,
   nodes: TaintNode[],
   edges: TaintEdge[],
-  visitedCount: number
+  visitedCount: number,
+  minFraction = 0.0008
 ): TaintResult {
   // Frontier remainder is the not-yet-traced value — counted as unresolved for
   // THIS snapshot only, never baked into the resumable origins (else continuing
-  // would double-count it).
+  // would double-count it). "to go" / done only consider MATERIAL entries:
+  // sub-threshold dust will never be crawled, so it shouldn't inflate the queue.
   let remaining = 0;
-  for (const c of frontier.values()) remaining += c;
+  let materialCount = 0;
+  for (const c of frontier.values()) {
+    remaining += c;
+    if (c >= minFraction) materialCount += 1;
+  }
 
   const display = new Map<string, OriginAcc>();
   for (const [k, v] of origins) display.set(k, { ...v });
@@ -306,7 +313,8 @@ function snapshot(
   if (service > 0.05) score = Math.max(score, Math.min(45, 18 + service * 60));
   if (mixedFraction > 0.02) score = Math.max(score, Math.min(58, 24 + mixedFraction * 55));
 
-  const done = frontier.size === 0;
+  // "done" = no MATERIAL work left to crawl (only immaterial dust may remain).
+  const done = materialCount === 0;
   const state: TaintState = {
     seed,
     totalSat,
@@ -319,12 +327,25 @@ function snapshot(
     visitedCount,
   };
 
+  // Graph = resolved/traced nodes + the still-to-crawl frontier tips (so the
+  // user sees which branches reach a category vs. which need more crawling).
+  const graphNodes: TaintNode[] = nodes.slice();
+  for (const [txid, c] of frontier) {
+    if (c >= minFraction)
+      graphNodes.push({
+        txid,
+        contribution: c,
+        kind: "frontier",
+        blockTime: blockTimes.get(txid),
+      });
+  }
+
   return {
     seed,
     totalSat,
     coverage: Math.max(0, Math.min(1, 1 - unresolvedFraction)),
     nodesVisited: visitedCount,
-    frontierSize: frontier.size,
+    frontierSize: materialCount,
     done,
     truncated: !done,
     origins: list,
@@ -334,7 +355,7 @@ function snapshot(
     unresolvedFraction,
     score,
     band: bandFor(score),
-    graph: { nodes, edges },
+    graph: { nodes: graphNodes, edges },
     state,
   };
 }

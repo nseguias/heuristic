@@ -11,13 +11,11 @@ import {
 } from "@/lib/api";
 import { trace } from "@/lib/trace";
 import { buildScreening, type ScreeningReport } from "@/lib/screening";
-import { traceProvenance, type ProvenanceResult } from "@/lib/provenance";
 import { traceTaint, type TaintResult } from "@/lib/taint";
-import { labelFor } from "@/lib/labels";
 import { riskRamp, C } from "@/lib/colors";
 import { formatPercent, truncateHash } from "@/lib/format";
 import { MicroLabel } from "./ui";
-import ProvenanceGraph from "./ProvenanceGraph";
+import TaintGraph from "./TaintGraph";
 
 type Phase =
   | { s: "idle" }
@@ -26,7 +24,6 @@ type Phase =
   | {
       s: "done";
       report: ScreeningReport;
-      prov: ProvenanceResult | null;
       taint: TaintResult | null;
     };
 
@@ -52,6 +49,16 @@ function verdictFor(r: ScreeningReport, taint: TaintResult | null): Verdict {
       title: "Do not accept",
       sub: `This address is itself flagged: ${r.self.name}. Transacting with it is the risk — not where its coins came from.`,
       color: C.taint,
+    };
+
+  // The sender is itself a known, clean entity — its label is authoritative for
+  // the acceptance question, regardless of where it sourced its own coins.
+  if (r.self)
+    return {
+      tone: "safe",
+      title: "Likely safe to accept",
+      sub: `Sender is ${r.self.name} — a known ${r.self.category} entity.`,
+      color: C.clean,
     };
 
   // Value-weighted ancestry over ALL paths — the real source-of-funds check.
@@ -97,7 +104,7 @@ function verdictFor(r: ScreeningReport, taint: TaintResult | null): Verdict {
     };
   }
 
-  // Sender is a known entity (clean) — its label is the answer.
+  // Fallback (no taint result, unknown sender) — lean on the screening score.
   if (r.score >= 50)
     return {
       tone: "avoid",
@@ -115,94 +122,15 @@ function verdictFor(r: ScreeningReport, taint: TaintResult | null): Verdict {
   return {
     tone: "safe",
     title: "Likely safe to accept",
-    sub: r.self
-      ? `Sender is ${r.self.name} — a known ${r.self.category} entity.`
-      : "No exposure to hacks, sanctions, or heavy mixing.",
+    sub: "No exposure to hacks, sanctions, or heavy mixing.",
     color: C.clean,
   };
-}
-
-/** Accurate "~YYYY" from a block timestamp (never a future year). */
-function yearOf(unixSec?: number): string {
-  if (!unixSec) return "";
-  const y = new Date(unixSec * 1000).getUTCFullYear();
-  return ` back to ${y}`;
-}
-
-// Honest, useful prose for the source-of-funds section — never presents an
-// unresolved trace as if the verdict depended on it.
-function whereFrom(r: ScreeningReport, prov: ProvenanceResult): string {
-  const back = yearOf(prov.oldestBlockTime);
-
-  // The sender itself is the flagged entity — provenance is supplementary, and
-  // the verdict stands on complete data (we know this wallet), not the trace.
-  if (r.self && r.self.risk >= 0.5)
-    return `These coins sit in the flagged wallet itself (${r.self.name}) — that alone decides the verdict, so tracing their deeper origin isn't required.`;
-
-  if (prov.reachedGenesis)
-    return `Traced ${prov.hops} hops to freshly-mined coins (block ${prov.originBlock?.toLocaleString()}) — the cleanest possible lineage.`;
-
-  if (prov.origin === "exchange")
-    return `Coins trace back to ${prov.originLabel?.name}, a KYC exchange — a clean origin.`;
-
-  if (prov.origin === "flagged")
-    return `The dominant value path reaches ${prov.originLabel?.name} ${prov.hops} hops back — a definitive flagged origin.`;
-
-  if (prov.origin === "mixed")
-    return `The trail goes cold ${prov.hops} hops back at a coinjoin: the coins were deliberately mixed, so their pre-mix origin is unrecoverable by design. That mixing is already reflected in the score — this is a complete answer, not a missing one.`;
-
-  if (prov.origin === "dead-end")
-    return `The dominant value path ends ${prov.hops} hops back${back} with no flagged, exchange, or mining origin — nothing suspicious on the main trail.`;
-
-  // Hit the depth cap without a definitive signal. This is a real finding, not
-  // missing data: we crawled deep and the trail stayed clean.
-  return `We crawled the dominant value path ${prov.hops} hops${back} and hit no flag, coinjoin, or exchange — the main money trail is clean that far back. A typical coin has no single "genesis" to reach (its path merges with millions of others), so this is the complete answer the data supports${
-    r.score >= 25 ? "; any risk in the verdict comes from the exposure below." : "."
-  }`;
 }
 
 const SAMPLES = [
   { label: "A hack wallet (bad)", q: "1FeexV6bAHb8ybZjqQMjJrcCrHGW9sb6uF" },
   { label: "Traces to an exchange", q: "1NDyJtNTjmwk5xPNhjgAMu4HDHigtobu1s" },
 ];
-
-// Hop-by-hop trace graph of the dominant value path, back toward origin.
-function TracePath({ prov }: { prov: ProvenanceResult }) {
-  if (!prov.path.length) return null;
-  const hasBranches = prov.path.some((h) => h.branches?.length);
-
-  return (
-    <div className="mt-3 border-t border-line pt-3">
-      <MicroLabel>
-        Trace · dominant value path · {prov.path.length} hop
-        {prov.path.length === 1 ? "" : "s"} ·{" "}
-        {prov.resolved ? "resolved" : `stopped at ${prov.hops}-hop cap`}
-      </MicroLabel>
-      <ProvenanceGraph path={prov.path} />
-
-      {hasBranches && (
-        <p className="mt-1.5 font-mono text-[10px] leading-relaxed text-faint">
-          <span className="text-dim">Branches = merged inputs:</span> coins
-          co-spent in the same transaction — by the common-input-ownership
-          heuristic, probably the same owner (a probability, not proof; coinjoins
-          break it). Each one is screened for known entities and folded into the
-          exposure below; a flagged merged input would turn red and raise the
-          score. Click any node to trace it fully in the explorer.
-        </p>
-      )}
-
-      {!prov.resolved && (
-        <p className="mt-1 font-mono text-[10px] leading-relaxed text-faint">
-          We crawled to our {prov.hops}-hop depth cap without hitting a flag — a
-          practical limit on the public API, not a verdict gap. To crawl further
-          (it still won&apos;t reach a single &ldquo;genesis&rdquo; — no coin has
-          one), point HEURISTIC at your own node in{" "}
-          <span className="text-dim">⚙ settings</span>.
-        </p>
-      )}
-    </div>
-  );
-}
 
 export default function CoinCheck() {
   const router = useRouter();
@@ -211,7 +139,6 @@ export default function CoinCheck() {
   const [value, setValue] = useState(address);
   const [phase, setPhase] = useState<Phase>({ s: "idle" });
   const [picking, setPicking] = useState(false);
-  const [hopCount, setHopCount] = useState(0);
   const [taintProgress, setTaintProgress] = useState<{ n: number; cov: number } | null>(
     null
   );
@@ -285,40 +212,29 @@ export default function CoinCheck() {
         if (!txs.length) throw new Error("no transactions for this address yet");
         if (!live) return;
 
-        // If the sender is itself a known entity, its label IS the answer — no
-        // need to trace its (often enormous) ancestry. For an UNKNOWN sender we
-        // run the full value-weighted taint trace over the WHOLE ancestry, so
-        // the verdict considers every path, not just the dominant one.
-        const self = labelFor(address);
+        // Trace the WHOLE ancestry by value (every merged input followed back
+        // until it reaches a category, a coinbase, or a still-queued frontier
+        // node) — for every sender. The screening graph runs alongside it.
         setPhase({ s: "running", step: "crawling the source-of-funds trail" });
-        setHopCount(0);
         setTaintProgress(null);
-        const [graph, prov, taint] = await Promise.all([
+        const [graph, taint] = await Promise.all([
           trace(txs[0].txid, {
             direction: "both",
             depth: 3,
             maxNodes: 80,
           }).catch(() => undefined),
-          traceProvenance(txs[0].txid, fetchTx, {
-            maxHops: 60,
-            onHop: (h) => {
-              if (live) setHopCount(h);
+          traceTaint(txs[0].txid, fetchTx, {
+            timeBudgetMs: 12000,
+            onProgress: (n, cov) => {
+              if (live) setTaintProgress({ n, cov });
             },
           }).catch(() => null),
-          self
-            ? Promise.resolve(null)
-            : traceTaint(txs[0].txid, fetchTx, {
-                timeBudgetMs: 16000,
-                onProgress: (n, cov) => {
-                  if (live) setTaintProgress({ n, cov });
-                },
-              }).catch(() => null),
         ]);
         const report = buildScreening(address, txs, graph);
         if (!live) return;
 
         setLiveTaint(taint);
-        setPhase({ s: "done", report, prov, taint });
+        setPhase({ s: "done", report, taint });
       } catch (e) {
         if (live)
           setPhase({
@@ -436,9 +352,7 @@ export default function CoinCheck() {
             {phase.step}
             {phase.step.startsWith("crawling") && taintProgress
               ? ` · ${taintProgress.n} txs · ${taintProgress.cov}% of value`
-              : phase.step.startsWith("crawling") && hopCount > 0
-                ? ` · ${hopCount} hops`
-                : ""}
+              : ""}
             …
           </span>
           <span className="max-w-md font-mono text-[11px] leading-relaxed text-faint">
@@ -459,7 +373,6 @@ export default function CoinCheck() {
         <Result
           address={address}
           report={phase.report}
-          prov={phase.prov}
           taint={liveTaint}
           crawling={crawling}
           onKeepCrawling={keepCrawling}
@@ -524,6 +437,11 @@ function ValueBreakdown({
           </div>
         ))}
       </div>
+
+      {/* The traced ancestry tree — every branch ends at a category, a coinbase,
+          or a dashed "still to crawl" frontier node. */}
+      <TaintGraph taint={taint} />
+
       <p className="mt-2 font-mono text-[10px] leading-relaxed text-faint">
         Every funding path is followed back and weighted by how much of the
         coin&apos;s value flows through it, until it reaches a known entity, a
@@ -552,20 +470,20 @@ function ValueBreakdown({
 function Result({
   address,
   report,
-  prov,
   taint,
   crawling,
   onKeepCrawling,
 }: {
   address: string;
   report: ScreeningReport;
-  prov: ProvenanceResult | null;
   taint: TaintResult | null;
   crawling: boolean;
   onKeepCrawling: () => void;
 }) {
   const v = verdictFor(report, taint);
-  const score = Math.max(report.score, taint?.score ?? 0);
+  // A known sender's label is authoritative; otherwise take the worse of the
+  // screening and the value-weighted ancestry score.
+  const score = report.self ? report.score : Math.max(report.score, taint?.score ?? 0);
   const icon = v.tone === "safe" ? "✓" : v.tone === "review" ? "⚠" : "✕";
 
   return (
@@ -614,32 +532,6 @@ function Result({
           crawling={crawling}
           onKeepCrawling={onKeepCrawling}
         />
-      )}
-
-      {/* Source of funds */}
-      {prov && (
-        <div className="mt-3 rounded-[3px] border border-line bg-surface/40 px-4 py-3">
-          <MicroLabel>Where the money came from</MicroLabel>
-          <p className="mt-1.5 font-mono text-[13px] leading-relaxed text-ink">
-            {whereFrom(report, prov)}
-          </p>
-          {prov.events.length > 0 && (
-            <ul className="mt-1.5 space-y-0.5">
-              {prov.events.slice(0, 4).map((e, i) => (
-                <li
-                  key={i}
-                  className="font-mono text-[11px]"
-                  style={{
-                    color: e.risk >= 50 ? "var(--warn)" : "var(--text-faint)",
-                  }}
-                >
-                  → {e.reason}
-                </li>
-              ))}
-            </ul>
-          )}
-          <TracePath prov={prov} />
-        </div>
       )}
 
       {/* Exposure */}
