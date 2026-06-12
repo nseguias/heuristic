@@ -161,7 +161,45 @@ export default function TaintGraph({ taint }: { taint: TaintResult }) {
         if (keep.size < 240) keep.add(n.id);
       });
 
-    const nodes = all.filter((n) => keep.has(n.id));
+    const kept = all.filter((n) => keep.has(n.id));
+    const allLinks: GL[] = [];
+    for (const e of taint.graph.edges) {
+      const s = byId.get(e.from);
+      const t = byId.get(e.to);
+      if (s && t && keep.has(s.id) && keep.has(t.id))
+        allLinks.push({ source: s, target: t, value: e.value });
+    }
+    // Never show a node that isn't connected to anything.
+    const connected = new Set<string>();
+    for (const l of allLinks) {
+      connected.add(l.source.id);
+      connected.add(l.target.id);
+    }
+    const nodes = kept.filter((n) => connected.has(n.id) || n.isSeed);
+    const liveIds = new Set(nodes.map((n) => n.id));
+    const links = allLinks.filter(
+      (l) => liveIds.has(l.source.id) && liveIds.has(l.target.id)
+    );
+
+    // The dominant path: from the coin, follow the highest-value input each hop.
+    // Drawn bright & in front; everything else is dimmed background.
+    const primaryNodes = new Set<string>();
+    const primaryEdges = new Set<GL>();
+    {
+      let cur = nodes.find((n) => n.isSeed) ?? null;
+      const guard = new Set<string>();
+      while (cur && !guard.has(cur.id)) {
+        guard.add(cur.id);
+        primaryNodes.add(cur.id);
+        let best: GL | null = null;
+        for (const l of links)
+          if (l.target.id === cur.id && (!best || l.value > best.value)) best = l;
+        if (!best) break;
+        primaryEdges.add(best);
+        cur = best.source;
+      }
+    }
+
     // New seed → fresh layout; otherwise reuse remembered positions so existing
     // nodes stay put and only the newly-crawled ancestors animate in.
     if (posCache.current.seed !== taint.seed)
@@ -178,13 +216,6 @@ export default function TaintGraph({ taint }: { taint: TaintResult }) {
         n.x = c.x;
         n.y = c.y;
       }
-    }
-    const links: GL[] = [];
-    for (const e of taint.graph.edges) {
-      const s = byId.get(e.from);
-      const t = byId.get(e.to);
-      if (s && t && keep.has(s.id) && keep.has(t.id))
-        links.push({ source: s, target: t, value: e.value });
     }
 
     // Temporal x: oldest (origins) left, the coin (newest) right.
@@ -279,31 +310,47 @@ export default function TaintGraph({ taint }: { taint: TaintResult }) {
       ctx.translate(tx, ty);
       ctx.scale(k, k);
 
+      // Background edges first (dimmed), then the bright dominant-path edges.
       ctx.lineWidth = 1 / k;
       for (const l of links) {
-        ctx.strokeStyle = "rgba(231,222,202,0.13)";
+        if (primaryEdges.has(l)) continue;
+        ctx.strokeStyle = "rgba(231,222,202,0.07)";
         ctx.beginPath();
         ctx.moveTo(l.source.x ?? 0, l.source.y ?? 0);
         ctx.lineTo(l.target.x ?? 0, l.target.y ?? 0);
         ctx.stroke();
-        ctx.fillStyle = "rgba(231,222,202,0.28)";
+      }
+      ctx.lineWidth = 1.8 / k;
+      for (const l of primaryEdges) {
+        ctx.strokeStyle = "rgba(231,222,202,0.5)";
+        ctx.beginPath();
+        ctx.moveTo(l.source.x ?? 0, l.source.y ?? 0);
+        ctx.lineTo(l.target.x ?? 0, l.target.y ?? 0);
+        ctx.stroke();
+        ctx.fillStyle = "rgba(231,222,202,0.6)";
         arrowTo(l.source.x ?? 0, l.source.y ?? 0, l.target);
       }
 
       const hov = hoverRef.current;
-      for (const n of nodes) {
+      // Draw dimmed (off-path) nodes first, primary-path nodes on top.
+      const ordered = [...nodes].sort(
+        (a, b) =>
+          (primaryNodes.has(a.id) ? 1 : 0) - (primaryNodes.has(b.id) ? 1 : 0)
+      );
+      for (const n of ordered) {
         const x = n.x ?? 0,
           y = n.y ?? 0;
         const hovered = hov?.id === n.id;
+        const primary = primaryNodes.has(n.id) || n.isSeed || n.isTerminal;
+        ctx.globalAlpha = hovered || primary ? 1 : 0.32;
         ctx.shadowColor = n.color;
-        ctx.shadowBlur = hovered ? 16 : n.isTerminal || n.isSeed ? 11 : 4;
+        ctx.shadowBlur = hovered ? 16 : primary ? 10 : 2;
         ctx.beginPath();
         ctx.arc(x, y, n.r, 0, Math.PI * 2);
         ctx.fillStyle = C.surface;
         ctx.fill();
         ctx.shadowBlur = 0;
-        ctx.lineWidth = hovered ? 2.4 : n.isTerminal || n.isSeed ? 1.8 : 1.2;
-        // Frontier tips are dashed (not yet traced).
+        ctx.lineWidth = hovered ? 2.4 : primary ? 1.8 : 1;
         if (n.kind === "frontier") ctx.setLineDash([3, 2]);
         ctx.strokeStyle = n.color;
         ctx.stroke();
@@ -311,11 +358,11 @@ export default function TaintGraph({ taint }: { taint: TaintResult }) {
         if (n.isTerminal || n.isSeed) {
           ctx.beginPath();
           ctx.arc(x, y, n.r * 0.45, 0, Math.PI * 2);
-          ctx.globalAlpha = 0.5;
+          ctx.globalAlpha = (hovered || primary ? 1 : 0.32) * 0.5;
           ctx.fillStyle = n.color;
           ctx.fill();
-          ctx.globalAlpha = 1;
         }
+        ctx.globalAlpha = 1;
       }
       ctx.restore();
 

@@ -12,6 +12,7 @@ import {
 import { trace } from "@/lib/trace";
 import { buildScreening, type ScreeningReport } from "@/lib/screening";
 import { traceTaint, type TaintResult } from "@/lib/taint";
+import { labelFor } from "@/lib/labels";
 import { riskRamp, C } from "@/lib/colors";
 import { formatPercent, truncateHash } from "@/lib/format";
 import { MicroLabel } from "./ui";
@@ -212,9 +213,12 @@ export default function CoinCheck() {
         if (!txs.length) throw new Error("no transactions for this address yet");
         if (!live) return;
 
-        // Trace the WHOLE ancestry by value (every merged input followed back
-        // until it reaches a category, a coinbase, or a still-queued frontier
-        // node) — for every sender. The screening graph runs alongside it.
+        // If the sender is itself a known entity, the label IS the answer and
+        // its merged inputs are its own coins — no point deep-crawling its
+        // (enormous) internal ancestry. Only UNKNOWN senders get the full
+        // value-weighted taint trace, where every merged input is followed back
+        // until it reaches a category, a coinbase, or a frontier node.
+        const self = labelFor(address);
         setPhase({ s: "running", step: "crawling the source-of-funds trail" });
         setTaintProgress(null);
         const [graph, taint] = await Promise.all([
@@ -223,12 +227,14 @@ export default function CoinCheck() {
             depth: 3,
             maxNodes: 80,
           }).catch(() => undefined),
-          traceTaint(txs[0].txid, fetchTx, {
-            timeBudgetMs: 12000,
-            onProgress: (n, cov) => {
-              if (live) setTaintProgress({ n, cov });
-            },
-          }).catch(() => null),
+          self
+            ? Promise.resolve(null)
+            : traceTaint(txs[0].txid, fetchTx, {
+                timeBudgetMs: 12000,
+                onProgress: (n, cov) => {
+                  if (live) setTaintProgress({ n, cov });
+                },
+              }).catch(() => null),
         ]);
         const report = buildScreening(address, txs, graph);
         if (!live) return;
@@ -460,7 +466,7 @@ function ValueBreakdown({
         >
           {crawling
             ? "crawling deeper…"
-            : `↓ keep crawling · ${pct(taint.coverage)} covered · ${taint.frontierSize.toLocaleString()} to go`}
+            : `↓ keep crawling · ${pct(taint.coverage)} traced · ${pct(taint.unresolvedFraction)} of value still to resolve`}
         </button>
       )}
     </div>
