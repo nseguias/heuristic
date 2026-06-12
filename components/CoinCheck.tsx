@@ -12,6 +12,8 @@ import {
 import { trace } from "@/lib/trace";
 import { buildScreening, type ScreeningReport } from "@/lib/screening";
 import { traceProvenance, type ProvenanceResult } from "@/lib/provenance";
+import { traceTaint, type TaintResult } from "@/lib/taint";
+import { labelFor } from "@/lib/labels";
 import { riskRamp, C } from "@/lib/colors";
 import { formatPercent, truncateHash } from "@/lib/format";
 import { MicroLabel } from "./ui";
@@ -21,7 +23,12 @@ type Phase =
   | { s: "idle" }
   | { s: "running"; step: string }
   | { s: "error"; msg: string }
-  | { s: "done"; report: ScreeningReport; prov: ProvenanceResult | null };
+  | {
+      s: "done";
+      report: ScreeningReport;
+      prov: ProvenanceResult | null;
+      taint: TaintResult | null;
+    };
 
 interface Verdict {
   tone: "safe" | "review" | "avoid";
@@ -30,7 +37,13 @@ interface Verdict {
   color: string;
 }
 
-function verdictFor(r: ScreeningReport, prov: ProvenanceResult | null): Verdict {
+function pct(f: number): string {
+  if (f <= 0) return "0%";
+  if (f < 0.01) return "<1%";
+  return `${Math.round(f * 100)}%`;
+}
+
+function verdictFor(r: ScreeningReport, taint: TaintResult | null): Verdict {
   // The sender itself being a flagged entity (hack / sanctioned) is the worst
   // case — transacting with it is the problem, no matter where its coins came from.
   if (r.self && r.self.risk >= 0.5)
@@ -40,13 +53,51 @@ function verdictFor(r: ScreeningReport, prov: ProvenanceResult | null): Verdict 
       sub: `This address is itself flagged: ${r.self.name}. Transacting with it is the risk — not where its coins came from.`,
       color: C.taint,
     };
-  if (r.sanctioned)
+
+  // Value-weighted ancestry over ALL paths — the real source-of-funds check.
+  if (taint) {
+    const bad = taint.origins.find(
+      (o) => (o.key === "hack" || o.key === "sanctioned") && o.fraction >= 0.005
+    );
+    if (bad)
+      return {
+        tone: "avoid",
+        title: "Do not accept",
+        sub: `${pct(bad.fraction)} of the value traces to ${bad.name} — an exchange would flag this.`,
+        color: C.taint,
+      };
+    if (taint.score >= 50)
+      return {
+        tone: "avoid",
+        title: "High risk",
+        sub: "Material exposure across the coin's funding paths — likely flagged or frozen.",
+        color: C.taint,
+      };
+    if (taint.mixedFraction >= 0.1 || taint.score >= 25)
+      return {
+        tone: "review",
+        title: "Review before accepting",
+        sub: `${pct(taint.mixedFraction)} of the value passed through mixing — origin obscured for that share.`,
+        color: C.warn,
+      };
+    // No flags found. If we covered most of the value, that's a clean result;
+    // if coverage is thin, say what we DID check and flag it as unverified.
+    if (taint.coverage >= 0.8)
+      return {
+        tone: "safe",
+        title: "Likely safe to accept",
+        sub: `${pct(taint.cleanFraction)} of the value traces to clean origins; no hack, sanctions, or mixing across ${taint.nodesVisited} ancestor txs (${pct(taint.coverage)} of value covered).`,
+        color: C.clean,
+      };
     return {
-      tone: "avoid",
-      title: "Do not accept",
-      sub: "Exposure to a sanctioned or stolen-funds entity — an exchange would freeze this.",
-      color: C.taint,
+      tone: "review",
+      title: "No taint found — but trace is partial",
+      sub: `No hack, sanctions, or mixing in the ${taint.nodesVisited} ancestor txs we traced, but only ${pct(taint.coverage)} of the value resolved on the public API. Connect your own node to verify the rest before relying on this.`,
+      color: C.warn,
     };
+  }
+
+  // Sender is a known entity (clean) — its label is the answer.
   if (r.score >= 50)
     return {
       tone: "avoid",
@@ -58,20 +109,15 @@ function verdictFor(r: ScreeningReport, prov: ProvenanceResult | null): Verdict 
     return {
       tone: "review",
       title: "Review before accepting",
-      sub: "Some risk exposure (e.g. mixing) — check where the coins came from below.",
+      sub: "Some risk exposure — check the source below.",
       color: C.warn,
-    };
-  if (prov?.origin === "exchange")
-    return {
-      tone: "safe",
-      title: "Likely safe to accept",
-      sub: `Coins trace back to ${prov.originLabel?.name}, a KYC exchange — a clean origin.`,
-      color: C.clean,
     };
   return {
     tone: "safe",
     title: "Likely safe to accept",
-    sub: "No exposure to hacks, sanctions, or heavy mixing.",
+    sub: r.self
+      ? `Sender is ${r.self.name} — a known ${r.self.category} entity.`
+      : "No exposure to hacks, sanctions, or heavy mixing.",
     color: C.clean,
   };
 }
@@ -166,6 +212,9 @@ export default function CoinCheck() {
   const [phase, setPhase] = useState<Phase>({ s: "idle" });
   const [picking, setPicking] = useState(false);
   const [hopCount, setHopCount] = useState(0);
+  const [taintProgress, setTaintProgress] = useState<{ n: number; cov: number } | null>(
+    null
+  );
 
   useEffect(() => setValue(address), [address]);
 
@@ -211,27 +260,40 @@ export default function CoinCheck() {
         if (!txs.length) throw new Error("no transactions for this address yet");
         if (!live) return;
 
-        // Screening graph and the source-of-funds crawl are independent — run
-        // them concurrently so the wall-clock is the slower of the two, not both.
+        // If the sender is itself a known entity, its label IS the answer — no
+        // need to trace its (often enormous) ancestry. For an UNKNOWN sender we
+        // run the full value-weighted taint trace over the WHOLE ancestry, so
+        // the verdict considers every path, not just the dominant one.
+        const self = labelFor(address);
         setPhase({ s: "running", step: "crawling the source-of-funds trail" });
         setHopCount(0);
-        const [graph, prov] = await Promise.all([
+        setTaintProgress(null);
+        const [graph, prov, taint] = await Promise.all([
           trace(txs[0].txid, {
             direction: "both",
             depth: 3,
             maxNodes: 80,
           }).catch(() => undefined),
           traceProvenance(txs[0].txid, fetchTx, {
-            maxHops: 200,
+            maxHops: 60,
             onHop: (h) => {
               if (live) setHopCount(h);
             },
           }).catch(() => null),
+          self
+            ? Promise.resolve(null)
+            : traceTaint(txs[0].txid, fetchTx, {
+                maxNodes: 800,
+                timeBudgetMs: 18000,
+                onProgress: (n, cov) => {
+                  if (live) setTaintProgress({ n, cov });
+                },
+              }).catch(() => null),
         ]);
         const report = buildScreening(address, txs, graph);
         if (!live) return;
 
-        setPhase({ s: "done", report, prov });
+        setPhase({ s: "done", report, prov, taint });
       } catch (e) {
         if (live)
           setPhase({
@@ -347,14 +409,16 @@ export default function CoinCheck() {
           <span className="blink font-mono text-accent">◍</span>
           <span className="font-mono text-[13px] text-ink">
             {phase.step}
-            {phase.step.startsWith("crawling") && hopCount > 0
-              ? ` · ${hopCount} hops`
-              : ""}
+            {phase.step.startsWith("crawling") && taintProgress
+              ? ` · ${taintProgress.n} txs · ${taintProgress.cov}% of value`
+              : phase.step.startsWith("crawling") && hopCount > 0
+                ? ` · ${hopCount} hops`
+                : ""}
             …
           </span>
           <span className="max-w-md font-mono text-[11px] leading-relaxed text-faint">
             {phase.step.startsWith("crawling")
-              ? "Following the dominant value path back, one hop at a time. We stop the moment we hit a flag, a coinjoin, an exchange, or a coinbase — most coins resolve in a handful of hops. A clean coin can take a while: it has no single origin to reach."
+              ? "Following every funding path back, weighted by how much of the coin's value flows through it, until each reaches a known entity, a coinbase, or a coinjoin. We trace the whole ancestry — not just the biggest input — so the verdict considers all of it."
               : "walking the chain — this can take a few seconds"}
           </span>
         </div>
@@ -367,9 +431,73 @@ export default function CoinCheck() {
       )}
 
       {phase.s === "done" && (
-        <Result address={address} report={phase.report} prov={phase.prov} />
+        <Result
+          address={address}
+          report={phase.report}
+          prov={phase.prov}
+          taint={phase.taint}
+        />
       )}
     </main>
+  );
+}
+
+function originColor(o: TaintResult["origins"][number]): string {
+  if (o.key === "mixed") return C.mix;
+  if (o.key === "unresolved") return C.faint;
+  if (o.key === "coinbase") return C.clean;
+  return riskRamp(o.risk * 100);
+}
+
+// The honest "we checked everything" panel: value-weighted breakdown of where
+// the coin's value comes from, across ALL ancestry paths, with coverage.
+function ValueBreakdown({ taint }: { taint: TaintResult }) {
+  const segs = [
+    { label: "clean", frac: taint.cleanFraction, color: C.clean },
+    { label: "mixed", frac: taint.mixedFraction, color: C.mix },
+    { label: "flagged", frac: taint.badFraction, color: C.taint },
+    { label: "unresolved", frac: taint.unresolvedFraction, color: C.faint },
+  ].filter((s) => s.frac > 0.002);
+  const top = taint.origins.filter((o) => o.fraction >= 0.01).slice(0, 6);
+
+  return (
+    <div className="mt-3 rounded-[3px] border border-line bg-surface/40 px-4 py-3">
+      <MicroLabel>
+        Source of funds · value-weighted · {pct(taint.coverage)} of value traced ·{" "}
+        {taint.nodesVisited} ancestor txs{taint.truncated ? " · capped" : ""}
+      </MicroLabel>
+      <div className="mt-2 flex h-2.5 w-full overflow-hidden rounded-full bg-surface-2">
+        {segs.map((s) => (
+          <div
+            key={s.label}
+            style={{ width: `${s.frac * 100}%`, background: s.color }}
+            title={`${s.label} ${pct(s.frac)}`}
+          />
+        ))}
+      </div>
+      <div className="mt-2 space-y-1">
+        {top.map((o, i) => (
+          <div key={i} className="flex items-center gap-2 font-mono text-[11px]">
+            <span
+              className="h-2 w-2 shrink-0 rounded-full"
+              style={{ background: originColor(o) }}
+            />
+            <span className="text-dim">{o.name}</span>
+            <span className="ml-auto tabular-nums text-faint">
+              {pct(o.fraction)}
+            </span>
+          </div>
+        ))}
+      </div>
+      <p className="mt-2 font-mono text-[10px] leading-relaxed text-faint">
+        Every funding path is followed back and weighted by how much of the
+        coin&apos;s value flows through it, until it reaches a known entity, a
+        coinbase, or a coinjoin — not just the largest input.{" "}
+        {taint.coverage >= 0.9
+          ? `${pct(taint.coverage)} of the value is accounted for, so this is a complete result.`
+          : `${pct(1 - taint.coverage)} couldn't be traced within the public-API budget — connect your own node (⚙ settings) for full coverage.`}
+      </p>
+    </div>
   );
 }
 
@@ -377,12 +505,15 @@ function Result({
   address,
   report,
   prov,
+  taint,
 }: {
   address: string;
   report: ScreeningReport;
   prov: ProvenanceResult | null;
+  taint: TaintResult | null;
 }) {
-  const v = verdictFor(report, prov);
+  const v = verdictFor(report, taint);
+  const score = Math.max(report.score, taint?.score ?? 0);
   const icon = v.tone === "safe" ? "✓" : v.tone === "review" ? "⚠" : "✕";
 
   return (
@@ -415,14 +546,17 @@ function Result({
             <MicroLabel>Risk</MicroLabel>
             <div
               className="font-mono text-[26px] leading-none tabular-nums"
-              style={{ color: riskRamp(report.score) }}
+              style={{ color: riskRamp(score) }}
             >
-              {Math.round(report.score)}
+              {Math.round(score)}
               <span className="text-[11px] text-faint"> / 100</span>
             </div>
           </div>
         </div>
       </div>
+
+      {/* Value-weighted source-of-funds (all paths) */}
+      {taint && <ValueBreakdown taint={taint} />}
 
       {/* Source of funds */}
       {prov && (

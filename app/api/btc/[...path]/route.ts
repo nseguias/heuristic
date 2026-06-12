@@ -8,9 +8,9 @@ import { clientIp, rateLimit, tooManyRequests } from "@/lib/ratelimit";
  */
 const API_BASE = process.env.ESPLORA_API_BASE ?? "https://mempool.space/api";
 
-// Generous: a single deep trace fires many (mostly client-cached) requests, so
-// this allows normal heavy use while capping sustained abuse into the upstream.
-const RATE_LIMIT = 600; // requests
+// A single value-weighted taint check fans out to ~800+ ancestor-tx fetches, so
+// the cap must clear a few of those per minute while still stopping abuse.
+const RATE_LIMIT = 2500; // requests
 const RATE_WINDOW = 60_000; // per 60s, per IP
 
 const ALLOWED = [
