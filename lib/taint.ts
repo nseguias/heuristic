@@ -1,4 +1,4 @@
-import type { EsploraTx, LabelCategory, RiskBand } from "./types";
+import type { EsploraTx, LabelCategory, RiskBand, EntityLabel } from "./types";
 import { detectCoinjoin } from "./heuristics";
 import { labelFor } from "./labels";
 import { CATEGORY_META } from "./screening";
@@ -87,6 +87,53 @@ function bandFor(score: number): RiskBand {
   if (score >= 25) return "medium";
   if (score >= 8) return "low";
   return "clean";
+}
+
+/**
+ * The sender is itself a known entity — its label IS the origin. Build a trivial
+ * "coin ← entity" result so the check still shows the story as a chart, without
+ * deep-crawling the entity's (enormous) internal ancestry.
+ */
+export function knownEntityTaint(
+  seedTxid: string,
+  label: EntityLabel,
+  totalSat: number,
+  blockTime?: number
+): TaintResult {
+  const cat = label.category;
+  const clean = label.risk < 0.5;
+  const score = Math.round(label.risk * 100);
+  return {
+    seed: seedTxid,
+    totalSat: totalSat || 1,
+    coverage: 1,
+    nodesVisited: 1,
+    frontierSize: 0,
+    done: true,
+    truncated: false,
+    origins: [{ key: cat, name: label.name, fraction: 1, risk: label.risk }],
+    badFraction: cat === "hack" || cat === "sanctioned" ? 1 : 0,
+    mixedFraction: 0,
+    cleanFraction: clean ? 1 : 0,
+    unresolvedFraction: 0,
+    score,
+    band: bandFor(score),
+    graph: {
+      nodes: [{ txid: seedTxid, contribution: 1, kind: "tx", blockTime }],
+      edges: [{ from: `L:${cat}:${label.name}`, to: seedTxid, value: 1 }],
+    },
+    state: {
+      seed: seedTxid,
+      totalSat: totalSat || 1,
+      frontier: [],
+      blockTimes: [],
+      visited: [seedTxid],
+      origins: [],
+      nodes: [],
+      edges: [],
+      visitedCount: 1,
+    },
+  };
 }
 
 interface Opts {

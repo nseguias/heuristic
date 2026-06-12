@@ -11,7 +11,7 @@ import {
 } from "@/lib/api";
 import { trace } from "@/lib/trace";
 import { buildScreening, type ScreeningReport } from "@/lib/screening";
-import { traceTaint, type TaintResult } from "@/lib/taint";
+import { traceTaint, knownEntityTaint, type TaintResult } from "@/lib/taint";
 import { labelFor } from "@/lib/labels";
 import { riskRamp, C } from "@/lib/colors";
 import { formatPercent, truncateHash } from "@/lib/format";
@@ -138,6 +138,7 @@ export default function CoinCheck() {
   const params = useSearchParams();
   const address = params.get("address") ?? "";
   const [value, setValue] = useState(address);
+  const [rerun, setRerun] = useState(0); // bumped to re-check the same address
   const [phase, setPhase] = useState<Phase>({ s: "idle" });
   const [picking, setPicking] = useState(false);
   const [taintProgress, setTaintProgress] = useState<{ n: number; cov: number } | null>(
@@ -221,6 +222,10 @@ export default function CoinCheck() {
         const self = labelFor(address);
         setPhase({ s: "running", step: "crawling the source-of-funds trail" });
         setTaintProgress(null);
+        const seedSat = txs[0].vin.reduce(
+          (s, v) => s + (v.prevout?.value ?? 0),
+          0
+        );
         const [graph, taint] = await Promise.all([
           trace(txs[0].txid, {
             direction: "both",
@@ -228,7 +233,14 @@ export default function CoinCheck() {
             maxNodes: 80,
           }).catch(() => undefined),
           self
-            ? Promise.resolve(null)
+            ? Promise.resolve(
+                knownEntityTaint(
+                  txs[0].txid,
+                  self,
+                  seedSat,
+                  txs[0].status.block_time
+                )
+              )
             : traceTaint(txs[0].txid, fetchTx, {
                 timeBudgetMs: 12000,
                 onProgress: (n, cov) => {
@@ -252,13 +264,15 @@ export default function CoinCheck() {
     return () => {
       live = false;
     };
-  }, [address]);
+  }, [address, rerun]);
 
   const submit = async (q: string) => {
     const raw = q.trim();
     if (!raw) return;
     if (classifyQuery(raw) === "address") {
-      router.push(`/check?address=${encodeURIComponent(raw)}`);
+      // Same address already loaded → navigating is a no-op, so re-run manually.
+      if (raw === address) setRerun((n) => n + 1);
+      else router.push(`/check?address=${encodeURIComponent(raw)}`);
       return;
     }
     // A transaction id or UTXO (txid:vout) — resolve the sender (the dominant
@@ -417,8 +431,9 @@ function ValueBreakdown({
   return (
     <div className="mt-3 rounded-[3px] border border-line bg-surface/40 px-4 py-3">
       <MicroLabel>
-        Source of funds · value-weighted · {pct(taint.coverage)} of value traced ·{" "}
-        {taint.nodesVisited} ancestor txs{taint.truncated ? " · capped" : ""}
+        {taint.nodesVisited <= 1
+          ? "Source of funds · sender is a known entity"
+          : `Source of funds · value-weighted · ${pct(taint.coverage)} of value traced · ${taint.nodesVisited} ancestor txs${taint.truncated ? " · capped" : ""}`}
       </MicroLabel>
       <div className="mt-2 flex h-2.5 w-full overflow-hidden rounded-full bg-surface-2">
         {segs.map((s) => (
@@ -449,12 +464,11 @@ function ValueBreakdown({
       <TaintGraph taint={taint} />
 
       <p className="mt-2 font-mono text-[10px] leading-relaxed text-faint">
-        Every funding path is followed back and weighted by how much of the
-        coin&apos;s value flows through it, until it reaches a known entity, a
-        coinbase, or a coinjoin — not just the largest input.{" "}
-        {taint.done
-          ? "The frontier is empty — every path is fully resolved. This is the complete picture."
-          : `${pct(taint.unresolvedFraction)} of the value is still queued (${taint.frontierSize.toLocaleString()} ancestor txs). The only limit is fetch throughput on the public API — keep crawling to push coverage higher, or connect your own node for the full picture instantly.`}
+        {taint.nodesVisited <= 1
+          ? `The coin comes directly from ${taint.origins[0]?.name} — a labelled entity, so that's the origin; no deeper trace needed.`
+          : taint.done
+            ? "Every funding path is followed back and weighted by how much of the coin's value flows through it, until it reaches a known entity, a coinbase, or a coinjoin — not just the largest input. The frontier is empty — every path is fully resolved. This is the complete picture."
+            : `Every funding path is followed back and weighted by value, until it reaches a known entity, a coinbase, or a coinjoin. ${pct(taint.unresolvedFraction)} of the value is still queued (${taint.frontierSize.toLocaleString()} ancestor txs). The only limit is fetch throughput on the public API — keep crawling to push coverage higher, or connect your own node for the full picture instantly.`}
       </p>
 
       {!taint.done && (
