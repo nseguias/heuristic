@@ -123,6 +123,7 @@ const SAMPLES = [
 // Hop-by-hop trace graph of the dominant value path, back toward origin.
 function TracePath({ prov }: { prov: ProvenanceResult }) {
   if (!prov.path.length) return null;
+  const hasBranches = prov.path.some((h) => h.branches?.length);
 
   return (
     <div className="mt-3 border-t border-line pt-3">
@@ -132,6 +133,17 @@ function TracePath({ prov }: { prov: ProvenanceResult }) {
         {prov.resolved ? "resolved" : `stopped at ${prov.hops}-hop cap`}
       </MicroLabel>
       <ProvenanceGraph path={prov.path} />
+
+      {hasBranches && (
+        <p className="mt-1.5 font-mono text-[10px] leading-relaxed text-faint">
+          <span className="text-dim">Branches = merged inputs:</span> coins
+          co-spent in the same transaction — by the common-input-ownership
+          heuristic, probably the same owner (a probability, not proof; coinjoins
+          break it). Each one is screened for known entities and folded into the
+          exposure below; a flagged merged input would turn red and raise the
+          score. Click any node to trace it fully in the explorer.
+        </p>
+      )}
 
       {!prov.resolved && (
         <p className="mt-1 font-mono text-[10px] leading-relaxed text-faint">
