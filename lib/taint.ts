@@ -81,6 +81,14 @@ export interface TaintResult {
 
 const CLEAN_CATS: LabelCategory[] = ["exchange", "mining", "seizure", "historic"];
 
+// A frontier sliver below this fraction of the original coin is negligible dust
+// — the trace is "done" only once every remaining sliver is under it. Set very
+// low (≈0.001%) so coverage genuinely converges instead of stranding value.
+const EPS = 1e-5;
+// Frontier tips below this share aren't drawn as graph nodes (keeps the canvas
+// readable) — independent of EPS, which governs crawling, not display.
+const DISPLAY_MIN = 0.004;
+
 function bandFor(score: number): RiskBand {
   if (score >= 75) return "critical";
   if (score >= 50) return "high";
@@ -151,7 +159,7 @@ export async function traceTaint(
   resume?: TaintState
 ): Promise<TaintResult> {
   const maxNodesPerCall = opts.maxNodesPerCall ?? 1200;
-  const minFraction = opts.minFraction ?? 0.0008;
+  const minFraction = opts.minFraction ?? EPS;
   const concurrency = opts.concurrency ?? 16;
   const timeBudgetMs = opts.timeBudgetMs ?? 16000;
   const startMs = Date.now();
@@ -206,16 +214,14 @@ export async function traceTaint(
     visitedCount - startCount < maxNodesPerCall &&
     Date.now() - startMs < timeBudgetMs
   ) {
-    const batch = [...frontier.entries()]
-      .filter(([, c]) => c >= minFraction)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, concurrency);
-    if (batch.length === 0) break;
+    // Always expand the highest-value frontier tips first, drilling all the way
+    // down to EPS-level dust. Stop only when every remaining sliver is negligible
+    // (or the budget runs out) — that's what makes "keep crawling" converge.
+    const ranked = [...frontier.entries()].sort((a, b) => b[1] - a[1]);
+    if (ranked.length === 0 || ranked[0][1] < minFraction) break;
+    const batch = ranked.slice(0, concurrency);
 
-    for (const [txid] of batch) {
-      frontier.delete(txid);
-      visited.add(txid);
-    }
+    for (const [txid] of batch) frontier.delete(txid);
 
     const fetched = await Promise.all(
       batch.map(async ([txid]) => {
@@ -229,27 +235,35 @@ export async function traceTaint(
     for (let i = 0; i < batch.length; i++) {
       const [txid, contribution] = batch[i];
       const tx = fetched[i];
-      visitedCount += 1;
       const bt = blockTimes.get(txid);
+      // A tx reached again via another path (a "diamond" — normal in real
+      // ancestry, and never a cycle since tx history is an acyclic DAG) is
+      // re-weighted, not re-recorded: count it as a fresh ancestor and push its
+      // node + edges only the FIRST time it's expanded.
+      const first = !visited.has(txid);
+      if (first) {
+        visited.add(txid);
+        visitedCount += 1;
+      }
 
       if (!tx) {
         addOrigin("unresolved", "Unresolved", contribution);
-        nodes.push({ txid, contribution, kind: "unresolved", blockTime: bt });
+        if (first) nodes.push({ txid, contribution, kind: "unresolved", blockTime: bt });
         continue;
       }
       if (tx.vin.some((v) => v.is_coinbase)) {
         addOrigin("coinbase", "Coinbase (mined)", contribution);
-        nodes.push({ txid, contribution, kind: "coinbase", blockTime: bt });
+        if (first) nodes.push({ txid, contribution, kind: "coinbase", blockTime: bt });
         continue;
       }
       const cj = detectCoinjoin(tx);
       if (cj.isCoinjoin && cj.confidence >= 0.6) {
         addOrigin("mixed", "Coinjoin (mixed)", contribution);
-        nodes.push({ txid, contribution, kind: "mixed", blockTime: bt });
+        if (first) nodes.push({ txid, contribution, kind: "mixed", blockTime: bt });
         continue;
       }
       const sumIn = tx.vin.reduce((s, v) => s + (v.prevout?.value ?? 0), 0);
-      nodes.push({ txid, contribution, kind: "tx", blockTime: bt });
+      if (first) nodes.push({ txid, contribution, kind: "tx", blockTime: bt });
       if (sumIn <= 0) {
         addOrigin("unresolved", "Unresolved", contribution);
         continue;
@@ -262,15 +276,15 @@ export async function traceTaint(
         const label = addr ? labelFor(addr) : undefined;
         if (label) {
           addOrigin(label.category, label.name, share);
-          edges.push({ from: `L:${label.category}:${label.name}`, to: txid, value: share });
+          if (first)
+            edges.push({ from: `L:${label.category}:${label.name}`, to: txid, value: share });
           continue;
         }
         const childId = vin.txid;
-        edges.push({ from: childId, to: txid, value: share });
-        if (visited.has(childId)) {
-          addOrigin("unresolved", "Unresolved", share);
-          continue;
-        }
+        if (first) edges.push({ from: childId, to: txid, value: share });
+        // Re-accumulate onto the frontier instead of discarding a re-encountered
+        // ancestor as "unresolved" — this is what stops the trace leaking a third
+        // of the value and lets coverage actually converge.
         frontier.set(childId, (frontier.get(childId) ?? 0) + share);
         if (!blockTimes.has(childId)) blockTimes.set(childId, (bt ?? 0) - 1);
       }
@@ -305,7 +319,7 @@ function snapshot(
   nodes: TaintNode[],
   edges: TaintEdge[],
   visitedCount: number,
-  minFraction = 0.0008
+  minFraction = EPS
 ): TaintResult {
   // Frontier remainder is the not-yet-traced value — counted as unresolved for
   // THIS snapshot only, never baked into the resumable origins (else continuing
@@ -378,7 +392,7 @@ function snapshot(
   // user sees which branches reach a category vs. which need more crawling).
   const graphNodes: TaintNode[] = nodes.slice();
   for (const [txid, c] of frontier) {
-    if (c >= minFraction)
+    if (c >= DISPLAY_MIN)
       graphNodes.push({
         txid,
         contribution: c,
